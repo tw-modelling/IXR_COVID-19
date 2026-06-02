@@ -1,0 +1,631 @@
+// ============================================================================
+// IHR -- hospital admissions model
+// Pipeline: incidence -> prevalence (lognormal survival)
+//           -> positivity (true positives + false positives)
+//          -> admissions (Burr-III delay + NB2 observation model)
+//
+// The upstream incidence, prevalence, positivity, duration-of-positivity, and
+// sensitivity-given-detectability components are shared with the IFR model.
+// The outcome layer here links latent incidence to hospital admissions through
+// an age-specific onset-to-admission delay distribution and an IHR regression.
+// ============================================================================
+
+functions {
+  // Map unit-scale innovations to a second-order random-walk trajectory with
+  // innovation scale tau and an intercept. The first cumulative sum constructs
+  // first differences; the second cumulative sum constructs the trajectory.
+  vector rw2_transform(vector alpha_raw, real tau, real intercept) {
+    int T = rows(alpha_raw);
+    vector[T] delta = tau * alpha_raw;
+    delta[1] += intercept;
+    if (T >= 2)
+      delta[2:T] = cumulative_sum(delta[2:T]);
+    return cumulative_sum(delta);
+  }
+
+  // Apply the RW2 transform independently to each column of a matrix. Columns
+  // correspond to exchangeable group-specific trajectories, such as regions or
+  // age groups.
+  matrix rw2_transform_cols(matrix alpha_raw, real tau, vector intercepts) {
+    int TT = rows(alpha_raw);
+    int K  = cols(alpha_raw);
+    matrix[TT, K] out;
+    for (k in 1:K)
+      out[, k] = rw2_transform(col(alpha_raw, k), tau, intercepts[k]);
+    return out;
+  }
+
+  // Weighted arithmetic mean. The input data are checked in transformed data so
+  // the denominator is strictly positive.
+  real weighted_mean(vector values, vector weights) {
+    return dot_product(values, weights) / sum(weights);
+  }
+
+  // Conditional LFT sensitivity among people who remain LFT-detectable. The
+  // curve is bounded between lb and ub and declines with days from symptom onset.
+  vector sens_given_pos(vector dfso, real shift, real rate, real ub, real lb) {
+    return lb + (ub - lb) * inv_logit(shift - dfso / rate);
+  }
+
+  // Burr type III log CDF under the median parameterisation used for the
+  // onset-to-outcome delay distribution.
+  // F(x) = (1 + (x / c)^(-k))^(-a), where c is derived from the median.
+  real burr_typeIII_log_cdf(real x, real a, real k, real median) {
+    real z = log2() / a;
+    real log_c = log(median) + inv(k) * (z + log1m_exp(-z));
+    real y = -k * (log(x) - log_c);
+    return -a * log1p_exp(y);
+  }
+
+  // Discrete daily probability for the interval (t - 1, t]. The first day is
+  // the interval (0, 1]. CDF differences are evaluated on the log scale.
+  real burr_typeIII_pmf_day(int t, real a, real k, real median) {
+    if (t == 1) {
+      return exp(burr_typeIII_log_cdf(1 | a, k, median));
+    } else {
+      real lF_t   = burr_typeIII_log_cdf(t     | a, k, median);
+      real lF_tm1 = burr_typeIII_log_cdf(t - 1 | a, k, median);
+      return exp(log_diff_exp(lF_t, lF_tm1));
+    }
+  }
+
+  // Daily incidence proportion for a location-age-sex stratum. The sex effect
+  // is opposite-signed for the two sex categories, and incidence is scaled so
+  // that the daily proportion is bounded above by 5%.
+  vector inc(
+    int loc, int a, int x, int T,
+    vector beta_nat_time, matrix beta_loc_time, matrix beta_age_time,
+    vector beta_sex_time
+  ) {
+    vector[T] logit_p = beta_nat_time;
+    logit_p += col(beta_loc_time, loc);
+    logit_p += (x == 1) ? beta_sex_time : -beta_sex_time;
+    logit_p += col(beta_age_time, a);
+    return 0.05 * inv_logit(logit_p);
+  }
+
+  // Convolution of an incidence trajectory with a reversed discrete kernel over
+  // the observed period. The warmup period supplies the pre-observation history
+  // required by the convolution.
+  vector conv_rev(vector inc, vector K_rev, int T, int maxT, int warm) {
+    vector[T] out;
+    for (t in 1:T) {
+      int first = t - maxT + 1 + warm;
+      out[t] = dot_product(K_rev, segment(inc, first, maxT));
+    }
+    return out;
+  }
+}
+
+data {
+  // Positivity panel.
+  int<lower=1> N;
+  int<lower=1> T;
+  int<lower=1> L;
+  int<lower=1> A;
+  int<lower=1> W;
+
+  int N_warmup_days;
+
+  array[N] int<lower=1, upper=T> time;
+  array[N] int<lower=1, upper=L> location;
+  array[N] int<lower=1, upper=A> age_group;
+  array[N] int<lower=1, upper=2> sex;
+  array[N] int<lower=1, upper=2> holiday;
+  array[N] int<lower=1, upper=W> window;
+
+  array[N] int<lower=0> Y;
+  array[N] int<lower=0> pop;
+  matrix<lower=0>[W, 2] window_effect_n;
+
+  // RW2 innovation-scale prior rates.
+  real<lower=0> sigma_nat_prior;
+  real<lower=0> sigma_loc_prior;
+  real<lower=0> sigma_age_prior;
+  real<lower=0> sigma_sex_prior;
+
+  // Prediction tuples used in generated quantities.
+  int<lower=1> N_pred;
+  array[N_pred] int<lower=1, upper=T> time_pred;
+  array[N_pred] int<lower=1, upper=L> location_pred;
+  array[N_pred] int<lower=1, upper=A> age_group_pred;
+  array[N_pred] int<lower=1, upper=2> sex_pred;
+
+  // Duration-of-positivity intervals. The a variables refer to symptom-onset
+  // intervals and the b variables refer to last-positive-test intervals.
+  int<lower=1> N_dur_pos;
+  vector<lower=1>[N_dur_pos] count;
+  vector<lower=0>[N_dur_pos] a_minus;
+  vector<lower=0>[N_dur_pos] a_plus;
+  vector<lower=0>[N_dur_pos] b_minus;
+  vector<lower=0>[N_dur_pos] b_plus;
+  // Censoring type:
+  // 0 = interval-derived duration;
+  // 1 = right-censored lower bound b_minus - a;
+  // 2 = left-censored through onset upper bound b - a_plus;
+  // 3 = left-right censored lower bound b_minus - a_plus.
+  array[N_dur_pos] int<lower=0, upper=3> censor;
+  array[N_dur_pos] int<lower=1, upper=A> age_group_int;
+  int<lower=1> maxT_dur;
+
+  // Sensitivity-given-detectability training data from repeat testing.
+  int<lower=0> N_sgp_obs;
+  array[N_sgp_obs] int N_tests;
+  array[N_sgp_obs] int N_pos;
+  array[N_sgp_obs] int<lower=1, upper=A> sgp_age_group_int;
+  vector[N_sgp_obs] sgp_dfso;
+
+  // Admissions time series.
+  int<lower=1> maxT_hosp;
+  int<lower=1> N_hosp;
+  array[N_hosp] int<lower=1, upper=T> hosp_time;
+  array[N_hosp] int<lower=1, upper=A> hosp_age_group;
+  array[N_hosp] int<lower=1, upper=L> hosp_loc;
+  array[N_hosp] int<lower=1, upper=2> hosp_sex;
+  array[N_hosp] int<lower=1, upper=7> hosp_dow;
+  array[N_hosp] int<lower=0> hosp_admissions;
+
+  // Stratum populations used as offsets in the admissions model.
+  array[L, A, 2] real<lower=1e-9> hosp_pop;
+
+  // Hospitalisation-delay hierarchy priors, supplied on the log scale.
+  real m_ctr_prior_mean;
+  real a_ctr_prior_mean;
+  real b_ctr_prior_mean;
+
+  real<lower=0> m_ctr_prior_sd;
+  real<lower=0> a_ctr_prior_sd;
+  real<lower=0> b_ctr_prior_sd;
+
+  real m_var_prior_mean;
+  real a_var_prior_mean;
+  real b_var_prior_mean;
+
+  real<lower=0> m_var_prior_sd;
+  real<lower=0> a_var_prior_sd;
+  real<lower=0> b_var_prior_sd;
+
+  // NB2 dispersion hierarchy priors.
+  real          hosp_phi_ctr_prior_mean;
+  real<lower=0> hosp_phi_ctr_prior_sd;
+  real          hosp_phi_var_prior_mean;
+  real<lower=0> hosp_phi_var_prior_sd;
+}
+
+transformed data {
+  // Fixed constants used in the observation models and convolution grid.
+  real<lower=0, upper=1> specificity = 0.9999;
+  real<lower=0, upper=0.5> eps_sgp   = 0.05;
+  real<lower=0> WINDOW_EFFECT_SD     = sqrt(15);
+  real<lower=0> DOW_SIGMA_PRIOR_RATE = 5;
+  real<lower=0> N_DAY_OF_WEEK        = 7;
+
+  vector[maxT_dur] dfso_conv = linspaced_vector(maxT_dur, 0, maxT_dur - 1);
+
+  // The warmup must be at least as long as the longest look-back window minus
+  // one day so that every convolution has a complete pre-observation history.
+  if (N_warmup_days < maxT_dur - 1)
+    reject("N_warmup_days must be >= maxT_dur - 1.");
+  if (N_warmup_days < maxT_hosp - 1)
+    reject("N_warmup_days must be >= maxT_hosp - 1.");
+
+  // The window centring prior uses observed test counts as weights. Each
+  // holiday category must have positive total weight.
+  for (h in 1:2) {
+    if (sum(col(window_effect_n, h)) <= 0)
+      reject("window_effect_n has zero total weight for holiday category ", h);
+  }
+
+  // Log-population offsets for the admissions likelihood.
+  array[L, A, 2] real log_hosp_pop = log(hosp_pop);
+
+  // Global bounds used only to declare deterministic latent realised times.
+  real a_min = min(a_minus);
+  real a_max = max(a_plus);
+  real b_min = min(b_minus);
+  real b_max = max(b_plus);
+
+  // Basic interval consistency check.
+  for (n in 1:N_dur_pos)
+    if (b_plus[n] < a_minus[n])
+      reject("Inconsistent interval: b_plus < a_minus at row ", n);
+
+  // Symmetric beta shape parameter for latent placement within each interval.
+  // The concentration increases with the grouped row count.
+  vector[N_dur_pos] ab = (12 * count - 4) / 8.0;
+}
+
+parameters {
+  // RW2 unit-scale innovations.
+  vector[T + N_warmup_days]    beta_nat_time_raw;
+  matrix[T + N_warmup_days, L] beta_loc_time_raw;
+  matrix[T + N_warmup_days, A] beta_age_time_raw;
+  vector[T + N_warmup_days]    beta_sex_time_raw;
+  matrix[W, 2]                 beta_window_raw;
+
+  // RW2 innovation scales.
+  real<lower=0> sigma_nat_std;
+  real<lower=0> sigma_loc_std;
+  real<lower=0> sigma_age_std;
+  real<lower=0> sigma_sex_std;
+
+  // Non-centred intercepts and pooling scales.
+  real        intercept_nat_raw;
+  vector[A]   intercept_age_raw;
+  vector[L]   intercept_loc_raw;
+  real        intercept_sex_raw;
+
+  real<lower=0> intercept_age_sigma;
+  real<lower=0> intercept_loc_sigma;
+
+  // Duration-of-positivity hierarchy on a unit-scale parameterisation.
+  real          dur_pos_mu_central_std;
+  vector[A]     dur_pos_mu_std;
+  real<lower=0> dur_pos_mu_var_std;
+
+  real          dur_pos_log_sigma_central_std;
+  vector[A]     dur_pos_log_sigma_std;
+  real<lower=0> dur_pos_log_sigma_var_std;
+
+  // Latent placements within the onset and last-positive intervals.
+  vector<lower=0, upper=1>[N_dur_pos] a_window;
+  vector<lower=0, upper=1>[N_dur_pos] b_window;
+
+  // Sensitivity-given-detectability parameters.
+  real      shift_raw;
+  real      rate_mu;
+  vector[A] rate_beta;
+  real<lower=0> rate_sigma;
+
+  real<lower=0, upper=1> lb_mu;
+  real<lower=0>          lb_precision_raw;
+  vector<lower=0, upper=1>[A] lower_bound_raw;
+  real<lower=0, upper=1> gap_raw;
+
+  // Burr type III latent parameters for onset-to-admission delay.
+  real      onset_hosp_alpha_var_std;
+  real      onset_hosp_alpha_central_std;
+  real      onset_hosp_beta_var_std;
+  real      onset_hosp_beta_central_std;
+  real      onset_hosp_median_var_std;
+  real      onset_hosp_median_central_std;
+  vector[A] onset_hosp_median_std;
+  vector[A] onset_hosp_alpha_std;
+  vector[A] onset_hosp_beta_std;
+
+  // IHR regression parameters.
+  vector[A]     ihr_beta_age_std;
+
+  vector[L]     ihr_beta_loc_std;
+  real<lower=0> ihr_beta_loc_scale;
+
+  real          ihr_beta_sex_std;
+
+  sum_to_zero_vector[A] ihr_beta_age_sex_std;
+  real<lower=0>         ihr_beta_age_sex_scale;
+
+  // Day-of-week effects for admissions.
+  vector[7]     hosp_beta_dow_raw;
+  real<lower=0> hosp_sigma_dow_std;
+
+  // Age-specific NB2 dispersion parameters for admissions.
+  real      hosp_phi_central_std;
+  real      hosp_phi_var_std;
+  vector[A] hosp_phi_std;
+}
+
+transformed parameters {
+  // Transform unit-scale innovation parameters to RW2 scales so that sigma_*
+  // has the intended exponential prior with the supplied rate.
+  real<lower=0> sigma_nat = sigma_nat_std / sigma_nat_prior;
+  real<lower=0> sigma_loc = sigma_loc_std / sigma_loc_prior;
+  real<lower=0> sigma_age = sigma_age_std / sigma_age_prior;
+  real<lower=0> sigma_sex = sigma_sex_std / sigma_sex_prior;
+
+  // RW2 latent trajectories for national, location, age, and sex effects.
+  vector[T + N_warmup_days] beta_nat_time
+    = rw2_transform(beta_nat_time_raw, sigma_nat, intercept_nat_raw * 3 - 4);
+  vector[T + N_warmup_days] beta_sex_time
+    = rw2_transform(beta_sex_time_raw, sigma_sex, 0.5 * intercept_sex_raw);
+  matrix[T + N_warmup_days, L] beta_loc_time
+    = rw2_transform_cols(beta_loc_time_raw, sigma_loc, intercept_loc_raw * intercept_loc_sigma);
+  matrix[T + N_warmup_days, A] beta_age_time
+    = rw2_transform_cols(beta_age_time_raw, sigma_age, intercept_age_raw * intercept_age_sigma);
+
+  // Derived latent trajectories and outcome expectations.
+  array[L, A, 2] vector[T + N_warmup_days] incidence;
+  array[L, A, 2] vector[T]                 prevalence;
+  array[L, A, 2] vector[T]                 positivity;
+  array[L, A, 2] vector[T]                 positivity_no_spec;
+  array[L, A, 2] real<lower=0, upper=1>    ihr;
+  array[L, A, 2] vector[T]                 expected_hospitalisations;
+
+  vector[N] positivity_windowed_logit;
+
+  // Realised latent onset and last-positive times within the feasible intervals.
+  vector<lower=b_min, upper=b_max>[N_dur_pos]
+    b = b_minus + (b_plus - b_minus) .* b_window;
+  vector<lower=a_min, upper=a_max>[N_dur_pos] a;
+  {
+    vector[N_dur_pos] ub_AB;
+    for (n in 1:N_dur_pos)
+      ub_AB[n] = fmin(a_plus[n], b[n]);
+    a = a_minus + (ub_AB - a_minus) .* a_window;
+  }
+
+  // Duration-of-positivity parameters by age group.
+  vector[A] dur_pos_mu;
+  vector<lower=0>[A] dur_pos_sigma;
+  {
+    real dur_pos_mu_central        = 2.5 * dur_pos_mu_central_std + 0.5;
+    real dur_pos_mu_var            = dur_pos_mu_var_std / 5;
+    real dur_pos_log_sigma_central = 0.5 * dur_pos_log_sigma_central_std - 1.5;
+    real dur_pos_log_sigma_var     = dur_pos_log_sigma_var_std / 5;
+
+    dur_pos_mu = dur_pos_mu_central + dur_pos_mu_std * dur_pos_mu_var;
+    dur_pos_sigma = exp(dur_pos_log_sigma_central
+                        + dur_pos_log_sigma_std * dur_pos_log_sigma_var);
+  }
+
+  // Survival kernel for remaining LFT-detectable. The first element represents
+  // day 0 and is fixed at one.
+  array[A] vector[maxT_dur] prob_still_pos;
+  for (i in 1:A) {
+    real mu_i    = dur_pos_mu[i];
+    real sigma_i = dur_pos_sigma[i];
+    for (t in 1:maxT_dur) {
+      if (t == 1) prob_still_pos[i, t] = 1;
+      else        prob_still_pos[i, t] = exp(lognormal_lccdf(t - 1 | mu_i, sigma_i));
+    }
+  }
+
+  // Burr type III onset-to-admission delay kernels, normalised and reversed for
+  // convolution with the incidence trajectory.
+  array[A] vector<lower=0>[maxT_hosp] admission_delay;
+  array[A] vector<lower=0>[maxT_hosp] admission_delay_rev;
+
+  real          a_ctr =     a_ctr_prior_mean + a_ctr_prior_sd * onset_hosp_alpha_central_std;
+  real<lower=0> a_var = exp(a_var_prior_mean + a_var_prior_sd * onset_hosp_alpha_var_std);
+  real          b_ctr =     b_ctr_prior_mean + b_ctr_prior_sd * onset_hosp_beta_central_std;
+  real<lower=0> b_var = exp(b_var_prior_mean + b_var_prior_sd * onset_hosp_beta_var_std);
+  real          m_ctr =     m_ctr_prior_mean + m_ctr_prior_sd * onset_hosp_median_central_std;
+  real<lower=0> m_var = exp(m_var_prior_mean + m_var_prior_sd * onset_hosp_median_var_std);
+
+  vector<lower=0>[A] a_par = exp(a_ctr + a_var * onset_hosp_alpha_std);
+  vector<lower=0>[A] b_par = exp(b_ctr + b_var * onset_hosp_beta_std);
+  vector<lower=0>[A] m_par = exp(m_ctr + m_var * onset_hosp_median_std);
+
+  for (i in 1:A) {
+    for (t in 1:maxT_hosp)
+      admission_delay[i, t] = burr_typeIII_pmf_day(t, a_par[i], b_par[i], m_par[i]);
+    admission_delay[i] /= sum(admission_delay[i]);
+    admission_delay_rev[i] = reverse(admission_delay[i]);
+  }
+
+  // Sensitivity-given-detectability bounds and fitted training probabilities.
+  real shift = 4 + sqrt(3) * shift_raw;
+  real<lower=0> lb_precision = 100 * lb_precision_raw;
+  real          lb_alpha     = lb_mu * lb_precision;
+  real          lb_beta      = (1 - lb_mu) * lb_precision;
+  vector<lower=0>[A] rate    = exp(log(1.5) + rate_mu + rate_beta * rate_sigma);
+
+  vector[A] lower_bound = (1 - eps_sgp) * lower_bound_raw;
+  vector[A] ub_age = lower_bound + eps_sgp + (1 - lower_bound - eps_sgp) * gap_raw;
+
+  vector[N_sgp_obs] sens_given_pos_fitting;
+  {
+    vector[N_sgp_obs] lb_sgp   = lower_bound[sgp_age_group_int];
+    vector[N_sgp_obs] ub_sgp   = ub_age[sgp_age_group_int];
+    vector[N_sgp_obs] rate_sgp = rate[sgp_age_group_int];
+    sens_given_pos_fitting = lb_sgp
+      + (ub_sgp - lb_sgp) .* inv_logit(shift - sgp_dfso ./ rate_sgp);
+  }
+
+  // Precompute reversed convolution kernels for prevalence and positivity.
+  array[A] vector[maxT_dur] sgp_conv;
+  array[A] vector[maxT_dur] S_rev;
+  array[A] vector[maxT_dur] Ktp_rev;
+  for (i in 1:A) {
+    sgp_conv[i] = sens_given_pos(dfso_conv, shift, rate[i], ub_age[i], lower_bound[i]);
+    S_rev[i]    = reverse(prob_still_pos[i]);
+    Ktp_rev[i]  = reverse(prob_still_pos[i] .* sgp_conv[i]);
+  }
+
+  // IHR regression effects on the logit scale.
+  vector[A] ihr_beta_age     = 3 * ihr_beta_age_std - 4;
+  real      ihr_beta_sex     = 0.3 * ihr_beta_sex_std;
+  vector[L] ihr_beta_loc     = ihr_beta_loc_scale * ihr_beta_loc_std;
+  vector[A] ihr_beta_age_sex = ihr_beta_age_sex_std * ihr_beta_age_sex_scale;
+
+  // Build latent incidence, prevalence, positivity, IHR, and expected admissions
+  // for every location-age-sex stratum.
+  for (l in 1:L)
+    for (i in 1:A)
+      for (x in 1:2) {
+        incidence[l, i, x]
+          = inc(l, i, x, T + N_warmup_days,
+                beta_nat_time, beta_loc_time, beta_age_time, beta_sex_time);
+
+        prevalence[l, i, x]
+          = conv_rev(incidence[l, i, x], S_rev[i], T, maxT_dur, N_warmup_days);
+
+        {
+          vector[T] tp = conv_rev(incidence[l, i, x], Ktp_rev[i], T, maxT_dur, N_warmup_days);
+          positivity_no_spec[l, i, x] = tp;
+          positivity[l, i, x] = tp + (1 - specificity) * (1 - prevalence[l, i, x]);
+        }
+
+        ihr[l, i, x] = inv_logit(
+            ihr_beta_loc[l]
+          + ihr_beta_age[i]
+          + (2 * x - 3) * ihr_beta_sex
+          + (2 * x - 3) * ihr_beta_age_sex[i]
+        );
+
+        expected_hospitalisations[l, i, x]
+          = conv_rev(incidence[l, i, x], admission_delay_rev[i], T, maxT_hosp, N_warmup_days)
+            * ihr[l, i, x];
+      }
+
+  // Day-of-week effects for admissions. The arithmetic mean multiplicative
+  // day-of-week effect is softly shrunk towards one.
+  real<lower=0> hosp_sigma_dow = hosp_sigma_dow_std / DOW_SIGMA_PRIOR_RATE;
+  vector[7]     hosp_beta_dow = hosp_beta_dow_raw * hosp_sigma_dow;
+  real log_mean_exp_hosp_beta = log_sum_exp(hosp_beta_dow) - log(N_DAY_OF_WEEK);
+
+  // Log-mean for the NB2 admissions data-generating distribution.
+  vector[N_hosp] eta_hosp;
+  for (n in 1:N_hosp) {
+    real rate_n = expected_hospitalisations[hosp_loc[n], hosp_age_group[n], hosp_sex[n]][hosp_time[n]];
+    eta_hosp[n] = log(rate_n)
+                + hosp_beta_dow[hosp_dow[n]]
+                + log_hosp_pop[hosp_loc[n], hosp_age_group[n], hosp_sex[n]];
+  }
+
+  // Age-specific NB2 dispersion with partial pooling on the log scale.
+  real               hosp_phi_central =     hosp_phi_ctr_prior_mean + hosp_phi_ctr_prior_sd * hosp_phi_central_std;
+  real<lower=0>      hosp_phi_var     = exp(hosp_phi_var_prior_mean + hosp_phi_var_prior_sd * hosp_phi_var_std);
+  vector<lower=0>[A] hosp_phi         = exp(hosp_phi_central + hosp_phi_var * hosp_phi_std);
+
+  // Window-by-holiday offsets applied on the logit scale of positivity.
+  matrix[W, 2] beta_window = beta_window_raw * WINDOW_EFFECT_SD;
+  for (n in 1:N) {
+    real p = positivity[location[n], age_group[n], sex[n]][time[n]];
+    positivity_windowed_logit[n] = logit(p) + beta_window[window[n], holiday[n]];
+  }
+}
+
+model {
+  // RW2 scale priors on the unit scale.
+  sigma_nat_std ~ exponential(1);
+  sigma_loc_std ~ exponential(1);
+  sigma_age_std ~ exponential(1);
+  sigma_sex_std ~ exponential(1);
+
+  // Non-centred intercept priors.
+  intercept_nat_raw ~ std_normal();
+  intercept_age_raw ~ std_normal();
+  intercept_loc_raw ~ std_normal();
+  intercept_sex_raw ~ std_normal();
+
+  // Intercept pooling scales for age and location trajectories.
+  intercept_age_sigma ~ exponential(0.5);
+  intercept_loc_sigma ~ exponential(0.5);
+
+  // Window effects, softly centred within each holiday category.
+  to_vector(beta_window_raw) ~ std_normal();
+  for (h in 1:2) {
+    vector[W] bw_col = col(beta_window, h);
+    vector[W] wn_col = col(window_effect_n, h);
+    weighted_mean(bw_col, wn_col) ~ normal(0, 0.01);
+  }
+
+  // RW2 unit innovations.
+  beta_nat_time_raw ~ std_normal();
+  beta_sex_time_raw ~ std_normal();
+  to_vector(beta_loc_time_raw) ~ std_normal();
+  to_vector(beta_age_time_raw) ~ std_normal();
+
+  // Positivity data-generating distribution.
+  Y ~ binomial_logit(pop, positivity_windowed_logit);
+
+  // Duration-of-positivity hierarchy priors.
+  dur_pos_mu_central_std ~ std_normal();
+  dur_pos_mu_std ~ std_normal();
+  dur_pos_mu_var_std ~ exponential(1);
+
+  dur_pos_log_sigma_central_std ~ std_normal();
+  dur_pos_log_sigma_std ~ std_normal();
+  dur_pos_log_sigma_var_std ~ exponential(1);
+
+  // Latent interval placements.
+  a_window ~ beta(ab, ab);
+  b_window ~ beta(ab, ab);
+
+  // Duration-of-positivity data contributions by censoring type.
+  for (n in 1:N_dur_pos) {
+    int  i       = age_group_int[n];
+    real mu_i    = dur_pos_mu[i];
+    real sigma_i = dur_pos_sigma[i];
+
+    if      (censor[n] == 0)
+      target += count[n] * lognormal_lupdf(b[n] - a[n] | mu_i, sigma_i);
+    else if (censor[n] == 1)
+      target += count[n] * lognormal_lccdf(b_minus[n] - a[n] | mu_i, sigma_i);
+    else if (censor[n] == 2)
+      target += count[n] * lognormal_lccdf(b[n] - a_plus[n] | mu_i, sigma_i);
+    else if (censor[n] == 3)
+      target += count[n] * lognormal_lccdf(b_minus[n] - a_plus[n] | mu_i, sigma_i);
+  }
+
+  // Sensitivity-given-detectability priors and repeat-testing data.
+  shift_raw  ~ std_normal();
+  rate_mu    ~ std_normal();
+  rate_beta  ~ std_normal();
+  rate_sigma ~ exponential(1);
+
+  lb_mu ~ beta(12, 18);
+  lb_precision_raw ~ exponential(2);
+  lower_bound_raw  ~ beta(lb_alpha, lb_beta);
+  gap_raw          ~ beta(7.5, 2);
+
+  if (N_sgp_obs > 0)
+    N_pos ~ binomial(N_tests, sens_given_pos_fitting);
+
+  // Burr type III hierarchy priors for onset-to-admission delay.
+  onset_hosp_alpha_var_std      ~ std_normal();
+  onset_hosp_alpha_central_std  ~ std_normal();
+  onset_hosp_alpha_std          ~ std_normal();
+  onset_hosp_beta_var_std       ~ std_normal();
+  onset_hosp_beta_central_std   ~ std_normal();
+  onset_hosp_beta_std           ~ std_normal();
+  onset_hosp_median_var_std     ~ std_normal();
+  onset_hosp_median_central_std ~ std_normal();
+  onset_hosp_median_std         ~ std_normal();
+
+  // IHR regression priors.
+  ihr_beta_age_std     ~ std_normal();
+  ihr_beta_loc_std     ~ std_normal();
+  ihr_beta_sex_std     ~ std_normal();
+  ihr_beta_age_sex_std ~ std_normal();
+
+  ihr_beta_loc_scale     ~ exponential(1);
+  ihr_beta_age_sex_scale ~ exponential(1);
+
+  // NB2 dispersion priors.
+  hosp_phi_central_std ~ std_normal();
+  hosp_phi_var_std     ~ std_normal();
+  hosp_phi_std         ~ std_normal();
+
+  // Admissions day-of-week effect priors.
+  hosp_beta_dow_raw      ~ std_normal();
+  hosp_sigma_dow_std     ~ exponential(1);
+  log_mean_exp_hosp_beta ~ normal(0, 0.01);
+
+  // Admissions data-generating distribution.
+  hosp_admissions ~ neg_binomial_2_log(eta_hosp, hosp_phi[hosp_age_group]);
+}
+
+generated quantities {
+  // Posterior predictive summaries and derived epidemiological quantities.
+  array[N_pred] real incidence_pred;
+  array[N_pred] real prevalence_pred;
+  array[N_pred] real positivity_pred;
+  array[N_pred] real implicit_sensitivity;
+  array[N_hosp] int<lower=0> hosps_pred_gen_obs;
+
+  for (n in 1:N_pred) {
+    incidence_pred[n]  = incidence[location_pred[n], age_group_pred[n], sex_pred[n]][time_pred[n] + N_warmup_days];
+    prevalence_pred[n] = prevalence[location_pred[n], age_group_pred[n], sex_pred[n]][time_pred[n]];
+    positivity_pred[n] = positivity[location_pred[n], age_group_pred[n], sex_pred[n]][time_pred[n]];
+    implicit_sensitivity[n] =
+      fmin(1,
+        positivity_no_spec[location_pred[n], age_group_pred[n], sex_pred[n]][time_pred[n]]
+        / prevalence_pred[n]
+      );
+  }
+
+  for (n in 1:N_hosp)
+    hosps_pred_gen_obs[n] = neg_binomial_2_log_rng(eta_hosp[n],
+                                                   hosp_phi[hosp_age_group[n]]);
+}
